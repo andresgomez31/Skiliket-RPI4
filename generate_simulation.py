@@ -1,6 +1,7 @@
 """
 generate_simulation.py
-Generates 1 year of simulated IoT measures for 3 campus nodes and inserts into Supabase.
+Generates 1 year of simulated IoT measures (with temperature) 
+for the campus nodes stored in the database.
 """
 
 from supabase import create_client
@@ -8,15 +9,16 @@ from dotenv import load_dotenv
 import os
 import math
 import random
-from datetime import datetime, timedelta, time, date
+from datetime import datetime, timedelta, time, date, timezone
 from typing import Tuple, List, Dict
 
 # ---------- CONFIG ----------
-START_DATE = datetime(2024, 1, 1)
-YEAR_LENGTH_DAYS = 365
+START_DATE = datetime(2025, 11, 15)
+YEAR_LENGTH_DAYS = 18
 STEP_MINUTES = 5
 BATCH_SIZE = 1000
-# ----------------------------
+SCHEMA = "public"
+
 
 load_dotenv()
 
@@ -28,12 +30,59 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 
 client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# ---------- NODES ----------
-NODES = [
-    {"name": "Gym", "location": ( -100.0, 20.0 )},
-    {"name": "Food center", "location": ( -100.001, 20.001 )},
-    {"name": "Library", "location": ( -100.002, 20.002 )},
-]
+# UPDATED NODES: join with locations and parse coordinates
+# Fetch nodes and locations separately and join in Python (filter locations with to_dt > now)
+nodes_raw = client.schema(SCHEMA).from_("nodes").select("*").execute().data or []
+print ("Fetched nodes:", len(nodes_raw))
+locations_raw = client.schema(SCHEMA).from_("locations").select("*").execute().data or []
+print ("Fetched locations:", len(locations_raw))
+
+def parse_point(pt: str):
+    pt = pt.strip("()")
+    lat, lon = pt.split(",")
+    return float(lat), float(lon)
+
+def parse_dt(dt_str: str) -> datetime:
+    if not dt_str:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    # preserve whether the string had a trailing Z (UTC) so we can attach tzinfo when needed
+    s = dt_str
+    has_z = s.endswith("Z")
+    if has_z:
+        s = s.rstrip("Z")
+    try:
+        dt = datetime.fromisoformat(s)
+    except Exception:
+        # fallback common formats
+        try:
+            dt = datetime.strptime(s, "%Y-%m-%dT%H:%M:%S")
+        except Exception:
+            return datetime.min.replace(tzinfo=timezone.utc)
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    else:
+        return dt.astimezone(timezone.utc)
+
+now = datetime.now(timezone.utc)
+
+# keep only locations with to_dt > now
+current_locations = [l for l in locations_raw if (parse_dt(l.get("to_dt")) > now or l.get("to_dt") is None)]
+
+print ("Using current locations:", len(current_locations))
+
+# join nodes with their current location (if any)
+NODES = []
+for n in nodes_raw:
+    loc = next((l for l in current_locations if l.get("node") == n.get("id")), None)
+    if not loc:
+        continue
+    lat, lon = parse_point(loc.get("location", "(0,0)"))
+    NODES.append({
+        "id": n.get("id"),
+        "name": n.get("name", "Unknown"),
+        "lat": lat,
+        "lon": lon,
+    })
 
 # ---------- Helpers ----------
 def nth_monday_of_month(year: int, month: int, n: int) -> date:
@@ -108,7 +157,31 @@ def occupancy_multiplier(dt: datetime, location_name: str, semester_ranges) -> f
     occ = dow * hour_pref * phase_factor * loc_pref
     return max(0.0, min(1.5, occ + random.gauss(0, 0.05)))
 
-# ---------- Sensors ----------
+# ---------- Temperature ----------
+def temperature_from_season_and_time(dt: datetime, location_name: str, occ: float) -> float:
+    # Seasonal baseline
+    month = dt.month
+    if month in (12,1,2): base = 17  # Winter
+    elif month in (3,4,5): base = 22  # Spring
+    elif month in (6,7,8): base = 26  # Summer
+    else: base = 21                   # Autumn
+
+    # Daily curve using sine wave
+    hour = dt.hour + dt.minute / 60
+    daily_variation = 6 * math.sin((hour - 14) / 24 * 2 * math.pi)
+
+    # Indoor adjustment per location
+    indoor_factor = {"Gym": 1.5, "Food center": 1.0, "Library": 0.5}.get(location_name, 1.0)
+
+    # Occupancy warms rooms slightly
+    occ_heat = occ * 1.8
+
+    temp = base + daily_variation + occ_heat + indoor_factor
+    temp += random.gauss(0, 0.6)
+
+    return max(10, min(40, temp))
+
+# ---------- Other sensors ----------
 def uv_from_time(dt: datetime, cloud_factor: float=1.0) -> float:
     hour = dt.hour + dt.minute/60
     angle = (hour - 13)/12 * math.pi
@@ -135,65 +208,9 @@ def noise_from_occ(occ, location_name):
     val = base + occ*25 + random.gauss(0,3)
     return max(20, min(120, val))
 
-# ---------- Supabase helper ----------
-def _resp_data(resp, allow_empty_select=True, expect_inserted=False):
-    if isinstance(resp, dict): data = resp.get("data")
-    else: data = getattr(resp, "data", None)
-
-    if data is None:
-        raise RuntimeError(f"Supabase request failed: {resp}")
-
-    if expect_inserted and isinstance(data, list) and not data:
-        raise RuntimeError(f"Insert returned empty: {resp}")
-
-    return data
-
-# ---------- Ensure nodes ----------
-def ensure_nodes_and_locations():
-    qry = client.schema("simulation").table("nodes").select("id,name").execute()
-    rows = _resp_data(qry)
-
-    existing = {r["name"]: r["id"] for r in rows or []}
-    node_records = []
-    node_id_map = {}
-
-    for n in NODES:
-        if n["name"] in existing:
-            node_id_map[n["name"]] = existing[n["name"]]
-        else:
-            node_records.append({"name": n["name"]})
-
-    if node_records:
-        ins = client.schema("simulation").table("nodes").insert(node_records).execute()
-        inserted = _resp_data(ins, expect_inserted=True)
-        for r in inserted:
-            node_id_map[r["name"]] = r["id"]
-
-    qry2 = client.schema("simulation").table("locations").select("node").execute()
-    loc_rows = _resp_data(qry2)
-    existing_loc = {r["node"] for r in loc_rows or []}
-
-    loc_records = []
-    for n in NODES:
-        nid = node_id_map[n["name"]]
-        if nid not in existing_loc:
-            point = f"({n['location'][0]},{n['location'][1]})"
-            loc_records.append({
-                "node": nid,
-                "location": point,
-                "from_dt": START_DATE.isoformat(),
-                "to_dt": (START_DATE + timedelta(days=365*5)).isoformat()
-            })
-
-    if loc_records:
-        ins2 = client.schema("simulation").table("locations").insert(loc_records).execute()
-        _resp_data(ins2, expect_inserted=True)
-
-    return node_id_map
-
 # ---------- Main generation ----------
 def generate_and_insert():
-    node_id_map = ensure_nodes_and_locations()
+    print("Using existing nodes from DB:", len(NODES))
 
     semester_ranges = semester_ranges_for_year(START_DATE.year)
     semester_ranges += semester_ranges_for_year(START_DATE.year - 1)
@@ -210,11 +227,11 @@ def generate_and_insert():
 
     while dt < end_dt:
         for n in NODES:
-            nid = node_id_map[n["name"]]
             occ = occupancy_multiplier(dt, n["name"], semester_ranges)
 
             spike = (random.random() < 0.001)
 
+            temp = temperature_from_season_and_time(dt, n["name"], occ)
             humidity = humidity_from_occ(dt, occ, n["name"])
             co2 = co2_from_occ(occ*(3 if spike else 1), n["name"])
             noise = noise_from_occ(occ*(3 if spike else 1), n["name"])
@@ -226,19 +243,21 @@ def generate_and_insert():
             uv = max(0.0, uv_raw * indoor * (0.5+0.5*occ) + random.gauss(0,0.05))
 
             rec = {
-                "node": nid,
-                "humidity": round(float(humidity),2),
-                "co2": round(float(co2),1),
-                "noise": round(float(noise),2),
-                "uv": round(float(uv),3),
+                "node": n["id"],
+                "temperature": round(float(temp), 2),
+                "humidity": round(float(humidity), 2),
+                "co2": round(float(co2), 1),
+                "noise": round(float(noise), 2),
+                "uv": round(float(uv), 3),
                 "measured_at": dt.isoformat()
             }
 
             batch.append(rec)
 
         if len(batch) >= BATCH_SIZE:
-            resp = client.schema("simulation").table("measures").insert(batch).execute()
-            _resp_data(resp)
+            resp = client.schema(SCHEMA).table("measures").insert(batch).execute()
+            if resp.data is None:
+                raise RuntimeError("Insert failed")
             total += len(batch)
             print(f"Inserted {total}...")
             batch = []
@@ -246,11 +265,11 @@ def generate_and_insert():
         dt += step
 
     if batch:
-        resp = client.schema("simulation").table("measures").insert(batch).execute()
-        _resp_data(resp)
+        resp = client.schema(SCHEMA).table("measures").insert(batch).execute()
+        if resp.data is None:
+            raise RuntimeError("Final insert failed")
         total += len(batch)
         print("Final inserted:", total)
 
 if __name__ == "__main__":
     generate_and_insert()
-
